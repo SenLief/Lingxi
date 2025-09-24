@@ -1,0 +1,15 @@
+version: '3.9'
+services:
+  lingxi-proxy:
+    build: .
+    image: lingxi-openai-proxy:latest
+    container_name: lingxi-openai-proxy
+    ports:
+      - "8787:8787"
+    environment:
+      - PORT=8787
+      - LINGXI_SESSION_ID=${LINGXI_SESSION_ID}
+      - LINGXI_COOKIE=${LINGXI_COOKIE}
+      - LINGXI_CLIENT_TYPE=${LINGXI_CLIENT_TYPE:-h5}
+      - LINGXI_USER_AGENT=${LINGXI_USER_AGENT:-Mozilla/5.0}
+    restart: unless-stopped

@@ -1,0 +1,19 @@
+.DS_Store
+node_modules/
+.npmrc
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.env
+.env.*
+ENV
+coverage/
+dist/
+.tmp/
+.cache/
+# Docker
+**/.dockerignore
+# Editor
+.vscode/
+.idea/

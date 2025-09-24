@@ -1,0 +1,20 @@
+{
+  "name": "lingxi-openai-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible /v1/chat/completions proxy that forwards to WPS Lingxi and maps responses (streaming + non-streaming).",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "NODE_ENV=development node src/index.js",
+    "test:request": "node test/request.test.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "morgan": "^1.10.0",
+    "undici": "^6.19.8"
+  }
+} 
