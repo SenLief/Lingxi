@@ -17,6 +17,7 @@ app.get('/', (req, res) => {
 app.use('/v1', apiRouter);
 
 const port = process.env.PORT || 8787;
-app.listen(port, () => {
-  console.log(`Lingxi OpenAI proxy listening on http://localhost:${port}`);
-}); 
+const host = process.env.HOST || '0.0.0.0';
+app.listen(port, host, () => {
+  console.log(`Lingxi OpenAI proxy listening on http://${host}:${port}`);
+});
