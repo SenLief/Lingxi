@@ -12,4 +12,5 @@ services:
       - LINGXI_COOKIE=${LINGXI_COOKIE}
       - LINGXI_CLIENT_TYPE=${LINGXI_CLIENT_TYPE:-h5}
       - LINGXI_USER_AGENT=${LINGXI_USER_AGENT:-Mozilla/5.0}
+      - LINGXI_LOG=${LINGXI_LOG:-1}
     restart: unless-stopped
