@@ -7,6 +7,105 @@ const ENV_LINGXI_SESSION_ID = process.env.LINGXI_SESSION_ID; // e.g. 97767917275
 const ENV_LINGXI_COOKIE = process.env.LINGXI_COOKIE; // raw cookie string with wps_sid etc.
 const ENV_LINGXI_USER_AGENT = process.env.LINGXI_USER_AGENT || 'Mozilla/5.0';
 const ENV_LINGXI_CLIENT_TYPE = process.env.LINGXI_CLIENT_TYPE || 'h5';
+const DEFAULT_REFRESH_URL = 'https://account.wps.cn/p/auth/check';
+const ENV_LINGXI_REFRESH_URL = process.env.LINGXI_REFRESH_URL; // optional endpoint to refresh cookies
+const ENV_LINGXI_LOG = String(process.env.LINGXI_LOG || '').toLowerCase(); // '1'|'true' to enable
+const ENV_LINGXI_ENABLE_AUTO_REFRESH = String(process.env.LINGXI_ENABLE_AUTO_REFRESH ?? '1').toLowerCase();
+const ENV_LINGXI_REFRESH_INTERVAL_MS = Number(process.env.LINGXI_REFRESH_INTERVAL_MS || 3600000); // default 1h
+
+// In-memory cookie that can be updated at runtime based on Set-Cookie
+let INMEM_LINGXI_COOKIE = ENV_LINGXI_COOKIE || '';
+
+function isLogEnabled(req) {
+  const h = req.headers || {};
+  const hv = String(h['x-log'] || h['x-logging'] || '').toLowerCase();
+  const enabledByHeader = hv === '1' || hv === 'true' || hv === 'yes';
+  const enabledByEnv = ENV_LINGXI_LOG === '1' || ENV_LINGXI_LOG === 'true' || ENV_LINGXI_LOG === 'yes';
+  return enabledByHeader || enabledByEnv;
+}
+
+function maskCookie(cookieStr) {
+  if (!cookieStr) return '';
+  return cookieStr
+    .split(';')
+    .map(kv => {
+      const [k, v] = kv.split('=');
+      if (!v) return kv.trim();
+      const key = k.trim();
+      const val = v.trim();
+      if (!val) return `${key}=`;
+      const kept = val.slice(0, 4);
+      return `${key}=${kept}***`;
+    })
+    .join('; ');
+}
+
+function maskQuestionPayload(payload) {
+  try {
+    if (!payload) return payload;
+    const q = payload.question || '';
+    const brief = q.length > 160 ? `${q.slice(0, 160)}...(${q.length})` : q;
+    return { ...payload, question: brief };
+  } catch {
+    return payload;
+  }
+}
+
+function parseSetCookieArray(res) {
+  try {
+    // Undici supports getSetCookie()
+    const arr = res.headers?.getSetCookie?.();
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+function mergeSetCookieIntoCookie(existingCookie, setCookieArray) {
+  if (!setCookieArray || setCookieArray.length === 0) return existingCookie || '';
+  const jar = new Map();
+  const pushToJar = (cookieStr) => {
+    cookieStr.split(';').forEach(part => {
+      const [k, v] = part.split('=');
+      if (!v) return;
+      const key = k.trim();
+      const val = v.trim();
+      if (!key || !val) return;
+      // ignore attributes like Path, HttpOnly etc. by keeping only first pair
+      if (!jar.has(key)) jar.set(key, val);
+    });
+  };
+  if (existingCookie) pushToJar(existingCookie);
+  for (const sc of setCookieArray) {
+    const firstPair = (sc || '').split(';')[0];
+    if (firstPair) pushToJar(firstPair);
+  }
+  return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+async function maybeRefreshCookie(cfg) {
+  if (!cfg.refreshUrl) return false;
+  const headers = {
+    'accept': 'application/json, text/plain, */*',
+    'cookie': cfg.cookie || INMEM_LINGXI_COOKIE,
+    'user-agent': cfg.userAgent,
+    'origin': FIXED_LINGXI_BASE_URL,
+    'referer': `${FIXED_LINGXI_BASE_URL}/`
+  };
+  const resp = await fetch(cfg.refreshUrl, {
+    method: 'POST',
+    headers,
+    body: ''
+  });
+  if (cfg.logEnabled) console.log('[Lingxi][refresh] %s -> %d', cfg.refreshUrl, resp.status);
+  const setCookies = parseSetCookieArray(resp);
+  if (setCookies.length > 0) {
+    INMEM_LINGXI_COOKIE = mergeSetCookieIntoCookie(cfg.cookie || INMEM_LINGXI_COOKIE, setCookies);
+    if (cfg.logEnabled) console.log('[Lingxi][refresh cookie merged] %s', maskCookie(INMEM_LINGXI_COOKIE));
+  }
+  // Consider 2xx as a successful refresh even without Set-Cookie (server-side TTL bump)
+  return resp.ok;
+}
 
 function resolveLingxiConfig(req) {
   const h = req.headers || {};
@@ -17,7 +116,9 @@ function resolveLingxiConfig(req) {
   const clientType = h['x-lingxi-client-type'] || ENV_LINGXI_CLIENT_TYPE;
   const ssePath = h['x-lingxi-sse-path'] || (sessionId ? `/api/aigc/v3/assistant/sessions/${sessionId}/completions` : undefined);
   const referer = h['x-lingxi-referer'] || (sessionId ? `${baseUrl}/chat/${sessionId}` : undefined);
-  return { baseUrl, sessionId, cookie, userAgent, clientType, ssePath, referer };
+  const refreshUrl = h['x-lingxi-refresh-url'] || ENV_LINGXI_REFRESH_URL || DEFAULT_REFRESH_URL;
+  const logEnabled = isLogEnabled(req);
+  return { baseUrl, sessionId, cookie, userAgent, clientType, ssePath, referer, refreshUrl, logEnabled };
 }
 
 function ensureLingxiEnv(config) {
@@ -89,7 +190,7 @@ function parseLingxiChunkToParts(obj) {
 }
 
 async function forwardLingxiNonStreaming(lingxiUrl, payload, headers) {
-  const res = await fetch(lingxiUrl, {
+  const doFetch = async () => fetch(lingxiUrl, {
     method: 'POST',
     headers: {
       'accept': 'text/event-stream',
@@ -101,6 +202,33 @@ async function forwardLingxiNonStreaming(lingxiUrl, payload, headers) {
     },
     body: JSON.stringify(payload)
   });
+
+  let res = await doFetch();
+  if (headers.logEnabled) {
+    // basic request log
+    console.log('[Lingxi][non-stream] POST', lingxiUrl);
+    console.log('[Lingxi][req headers] ua=%s client=%s referer=%s cookie=%s', headers.userAgent, headers.clientType, headers.referer, maskCookie(headers.cookie));
+    console.log('[Lingxi][req body]', maskQuestionPayload(payload));
+    console.log('[Lingxi][resp status]', res.status);
+  }
+
+  // Capture Set-Cookie to update in-memory cookie
+  const setCookies1 = parseSetCookieArray(res);
+  if (setCookies1.length > 0) {
+    INMEM_LINGXI_COOKIE = mergeSetCookieIntoCookie(headers.cookie, setCookies1);
+    headers.cookie = INMEM_LINGXI_COOKIE;
+    if (headers.logEnabled) console.log('[Lingxi][cookie updated from response] %s', maskCookie(INMEM_LINGXI_COOKIE));
+  }
+
+  if (!res.ok && (res.status === 401 || res.status === 403) && headers.refreshUrl) {
+    if (headers.logEnabled) console.log('[Lingxi] auth error %d, attempting cookie refresh via %s', res.status, headers.refreshUrl);
+    const refreshed = await maybeRefreshCookie(headers);
+    if (refreshed) {
+      headers.cookie = INMEM_LINGXI_COOKIE;
+      res = await doFetch();
+      if (headers.logEnabled) console.log('[Lingxi] retry after refresh -> status %d', res.status);
+    }
+  }
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -144,7 +272,7 @@ async function forwardLingxiStreaming(lingxiUrl, payload, headers, res) {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
-  const upstream = await fetch(lingxiUrl, {
+  const doFetch = async () => fetch(lingxiUrl, {
     method: 'POST',
     headers: {
       'accept': 'text/event-stream',
@@ -156,6 +284,32 @@ async function forwardLingxiStreaming(lingxiUrl, payload, headers, res) {
     },
     body: JSON.stringify(payload)
   });
+
+  let upstream = await doFetch();
+  if (headers.logEnabled) {
+    console.log('[Lingxi][stream] POST', lingxiUrl);
+    console.log('[Lingxi][req headers] ua=%s client=%s referer=%s cookie=%s', headers.userAgent, headers.clientType, headers.referer, maskCookie(headers.cookie));
+    console.log('[Lingxi][req body]', maskQuestionPayload(payload));
+    console.log('[Lingxi][resp status]', upstream.status);
+  }
+
+  // Update cookie from Set-Cookie
+  const setCookies1 = parseSetCookieArray(upstream);
+  if (setCookies1.length > 0) {
+    INMEM_LINGXI_COOKIE = mergeSetCookieIntoCookie(headers.cookie, setCookies1);
+    headers.cookie = INMEM_LINGXI_COOKIE;
+    if (headers.logEnabled) console.log('[Lingxi][cookie updated from response] %s', maskCookie(INMEM_LINGXI_COOKIE));
+  }
+
+  if ((!upstream.ok || !upstream.body) && (upstream.status === 401 || upstream.status === 403) && headers.refreshUrl) {
+    if (headers.logEnabled) console.log('[Lingxi] auth error %d(stream), attempting cookie refresh via %s', upstream.status, headers.refreshUrl);
+    const refreshed = await maybeRefreshCookie(headers);
+    if (refreshed) {
+      headers.cookie = INMEM_LINGXI_COOKIE;
+      upstream = await doFetch();
+      if (headers.logEnabled) console.log('[Lingxi] retry after refresh(stream) -> status %d', upstream.status);
+    }
+  }
 
   if (!upstream.ok || !upstream.body) {
     res.write(`data: ${JSON.stringify({ error: { message: `Lingxi HTTP ${upstream.status}` } })}\n\n`);
@@ -217,6 +371,10 @@ async function forwardLingxiStreaming(lingxiUrl, payload, headers, res) {
         try {
           const obj = JSON.parse(jsonMatch[0]);
           const part = parseLingxiChunkToParts(obj);
+          if (headers.logEnabled && (part.type === 'reasoning' || part.type === 'text')) {
+            const preview = (part.text || '').slice(0, 80);
+            console.log('[Lingxi][stream delta]', part.type, preview);
+          }
           if (part.type === 'reasoning') {
             sendReasoningDelta(part.text);
           } else if (part.type === 'reasoning_end') {
@@ -245,10 +403,12 @@ export async function handleChatCompletions(req, res) {
     const lingxiPayload = toLingxiPayloadFromOpenAI(body);
     const lingxiUrl = `${cfg.baseUrl}${cfg.ssePath}`;
     const headers = {
-      cookie: cfg.cookie,
+      cookie: cfg.cookie || INMEM_LINGXI_COOKIE,
       userAgent: cfg.userAgent,
       clientType: cfg.clientType,
-      referer: cfg.referer
+      referer: cfg.referer,
+      refreshUrl: cfg.refreshUrl,
+      logEnabled: cfg.logEnabled
     };
 
     if (stream) {
@@ -266,3 +426,35 @@ export async function handleChatCompletions(req, res) {
     res.status(500).json({ error: { message: err?.message || 'Internal error' } });
   }
 } 
+
+// Background hourly refresh to keep cookie alive (opt-in by default)
+let __autoRefreshTimer = null;
+function startAutoRefreshIfNeeded() {
+  const enabled = ENV_LINGXI_ENABLE_AUTO_REFRESH === '1' || ENV_LINGXI_ENABLE_AUTO_REFRESH === 'true' || ENV_LINGXI_ENABLE_AUTO_REFRESH === 'yes';
+  if (!enabled) return;
+  const intervalMs = Number.isFinite(ENV_LINGXI_REFRESH_INTERVAL_MS) && ENV_LINGXI_REFRESH_INTERVAL_MS > 0
+    ? ENV_LINGXI_REFRESH_INTERVAL_MS
+    : 3600000;
+  if (__autoRefreshTimer) return; // avoid duplicates
+  const cfg = {
+    refreshUrl: ENV_LINGXI_REFRESH_URL || DEFAULT_REFRESH_URL,
+    cookie: INMEM_LINGXI_COOKIE,
+    userAgent: ENV_LINGXI_USER_AGENT,
+    referer: `${FIXED_LINGXI_BASE_URL}/`,
+    logEnabled: ENV_LINGXI_LOG === '1' || ENV_LINGXI_LOG === 'true' || ENV_LINGXI_LOG === 'yes'
+  };
+  const tick = async () => {
+    try {
+      await maybeRefreshCookie(cfg);
+      // update cookie reference in cfg after potential merge
+      cfg.cookie = INMEM_LINGXI_COOKIE;
+    } catch (e) {
+      if (cfg.logEnabled) console.error('[Lingxi][auto-refresh error]', e?.message || e);
+    }
+  };
+  // initial attempt soon after startup
+  setTimeout(tick, 5000);
+  __autoRefreshTimer = setInterval(tick, intervalMs);
+}
+
+startAutoRefreshIfNeeded();
